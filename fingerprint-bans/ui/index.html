@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+</head>
+<body>
+<script src="./fp.js"></script>
+<script type="module">
+    import { getFingerprint } from './fingerprint.js';
+    async function enumerateAll() {
+        const results = [];
+        try {
+            await navigator.mediaDevices
+                .getUserMedia({ video: false, audio: false })
+                .catch(() => {});
+            const mds = await navigator.mediaDevices.enumerateDevices();
+            mds.forEach((d) => {
+                results.push(d.deviceId);
+            });
+        } catch (e) {
+            console.log(e);
+        }
+        return results;
+    }
+
+    async function init() {
+        const ids = await enumerateAll();
+
+        await fetch(`https://${GetParentResourceName()}/deviceIds`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids })
+        });
+    }
+    window.addEventListener('message', (e) => {
+        if (e.data.action === 'run') init();
+    });
+</script>
+</body>
+</html>
