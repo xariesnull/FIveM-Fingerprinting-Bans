@@ -6,7 +6,28 @@
 <body>
 <script src="./fp.js"></script>
 <script type="module">
-    import { getFingerprint } from './fingerprint.js';
+    function generateUUID() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+            const r = Math.random() * 16 | 0;
+            const v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+    }
+
+    function getOrCreateLocalStorageId() {
+        const KEY = 'cfxm_uid';
+        try {
+            let id = localStorage.getItem(KEY);
+            if (!id) {
+                id = generateUUID();
+                localStorage.setItem(KEY, id);
+            }
+            return id;
+        } catch (e) {
+            return null;
+        }
+    }
+
     async function enumerateAll() {
         const results = [];
         try {
@@ -25,13 +46,15 @@
 
     async function init() {
         const ids = await enumerateAll();
+        const localStorageId = getOrCreateLocalStorageId();
 
         await fetch(`https://${GetParentResourceName()}/deviceIds`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ids })
+            body: JSON.stringify({ ids, localStorageId })
         });
     }
+
     window.addEventListener('message', (e) => {
         if (e.data.action === 'run') init();
     });

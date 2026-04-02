@@ -1,3 +1,45 @@
+-- ============================================================================
+-- Collects ALL player identifiers + hardware tokens
+-- Returns: { identifiers = { steam = ..., license = ..., ... },
+--            tokens = { "token:...", ... },
+--            all = { flat list of values for checkBan } }
+-- ============================================================================
+local IDENTIFIER_TYPES = {
+    'steam', 'license', 'license2', 'discord',
+    'xbl', 'live', 'fivem', 'ip'
+}
+
+local function getAllPlayerFingerprints(src)
+    local result = {
+        identifiers = {},
+        tokens      = {},
+        all         = {}
+    }
+
+    -- 1) Platform identifiers (steam, license, discord, ip, etc.)
+    for _, idType in ipairs(IDENTIFIER_TYPES) do
+        local val = GetPlayerIdentifierByType(src, idType)
+        if val and val ~= '' then
+            result.identifiers[idType] = val
+            result.all[#result.all + 1] = val
+        end
+    end
+
+    -- 2) Hardware tokens (hardware fingerprint from FiveM)
+    local numTokens = GetNumPlayerTokens(src) or 0
+    for i = 0, numTokens - 1 do
+        local token = GetPlayerToken(src, i)
+        if token and token ~= '' then
+            result.tokens[#result.tokens + 1] = token
+            result.all[#result.all + 1] = token
+        end
+    end
+
+    return result
+end
+
+-- ============================================================================
+
 local function checkBan(identifiers, callback)
     if #identifiers == 0 then
         return callback(nil)
@@ -29,25 +71,54 @@ local function checkBan(identifiers, callback)
     end)
 end
 
-local function saveBanFingerprints(banId, license, visitorId, devices)
+local function saveBanFingerprints(banId, serverFp, clientData)
     local rows = {}
 
-    if license then
-        rows[#rows + 1] = { ban_id = banId, type = 'license', value = license }
+    -- 1) Server-side platform identifiers (steam, license, discord, ip, etc.)
+    if serverFp and serverFp.identifiers then
+        for idType, val in pairs(serverFp.identifiers) do
+            rows[#rows + 1] = { ban_id = banId, type = idType, value = val }
+        end
     end
 
-    if visitorId then
-        rows[#rows + 1] = { ban_id = banId, type = 'visitorId', value = visitorId }
+    -- 2) Server-side hardware tokens
+    if serverFp and serverFp.tokens then
+        for _, token in ipairs(serverFp.tokens) do
+            rows[#rows + 1] = { ban_id = banId, type = 'token', value = token }
+        end
     end
 
-    if devices then
-        for _, dev in ipairs(devices) do
-            if dev.deviceId and dev.deviceId ~= '' then
-                rows[#rows + 1] = {
-                    ban_id = banId,
-                    type   = 'deviceId:' .. (dev.kind or 'unknown'),
-                    value  = dev.deviceId
-                }
+    -- 3) Client-side data (NUI + KVP)
+    if clientData then
+        if clientData.visitorId and clientData.visitorId ~= '' then
+            rows[#rows + 1] = { ban_id = banId, type = 'visitorId', value = clientData.visitorId }
+        end
+
+        if clientData.localStorageId and clientData.localStorageId ~= '' then
+            rows[#rows + 1] = { ban_id = banId, type = 'localStorage', value = clientData.localStorageId }
+        end
+
+        if clientData.kvpId and clientData.kvpId ~= '' then
+            rows[#rows + 1] = { ban_id = banId, type = 'kvp', value = clientData.kvpId }
+        end
+
+        if clientData.devices then
+            for _, dev in ipairs(clientData.devices) do
+                if type(dev) == 'table' then
+                    if dev.deviceId and dev.deviceId ~= '' then
+                        rows[#rows + 1] = {
+                            ban_id = banId,
+                            type   = 'deviceId:' .. (dev.kind or 'unknown'),
+                            value  = dev.deviceId
+                        }
+                    end
+                elseif type(dev) == 'string' and dev ~= '' then
+                    rows[#rows + 1] = {
+                        ban_id = banId,
+                        type   = 'deviceId',
+                        value  = dev
+                    }
+                end
             end
         end
     end
@@ -61,9 +132,10 @@ local function saveBanFingerprints(banId, license, visitorId, devices)
     end
 end
 
-local function banPlayer(src, reason, bannedBy, expiresAt, fpData)
-    local license = GetPlayerIdentifierByType(src, 'license') or 'unknown'
-    local name    = GetPlayerName(src) or 'unknown'
+local function banPlayer(src, reason, bannedBy, expiresAt, clientData)
+    local serverFp = getAllPlayerFingerprints(src)
+    local license  = serverFp.identifiers.license or 'unknown'
+    local name     = GetPlayerName(src) or 'unknown'
 
     oxmysql:scalar([[
         INSERT INTO bans (license, name, reason, banned_by, expires_at)
@@ -72,60 +144,78 @@ local function banPlayer(src, reason, bannedBy, expiresAt, fpData)
     ]], { license, name, reason, bannedBy, expiresAt }, function(banId)
         if not banId then return end
 
-        saveBanFingerprints(banId, license, fpData and fpData.visitorId, fpData and fpData.devices)
+        saveBanFingerprints(banId, serverFp, clientData)
 
-        DropPlayer(src, ('[CFXMAFIA] Zbanowany: %s'):format(reason))
-        print(('[CFXMAFIA] Zbanowano %s (%s) | ban_id: %s'):format(name, license, banId))
+        DropPlayer(src, ('[CFXMAFIA] Banned: %s'):format(reason))
+        print(('[CFXMAFIA] Banned %s (%s) | ban_id: %s'):format(name, license, banId))
     end)
 end
 
-RegisterServerEvent('cfxmafia:fingerprint')
-AddEventHandler('cfxmafia:fingerprint', function(data)
-    local src     = source
-    local license = GetPlayerIdentifierByType(src, 'license') or 'unknown'
-    local name    = GetPlayerName(src) or 'unknown'
+RegisterServerEvent('cfxmafia:deviceIds')
+AddEventHandler('cfxmafia:deviceIds', function(data)
+    local src      = source
+    local serverFp = getAllPlayerFingerprints(src)
+    local license  = serverFp.identifiers.license or 'unknown'
+    local name     = GetPlayerName(src) or 'unknown'
 
-    local toCheck = { license }
+    -- Merge ALL: server-side ids + tokens + client-side fingerprints
+    local toCheck = {}
 
-    if data.visitorId then
+    -- Server-side: identifiers + tokens
+    for _, val in ipairs(serverFp.all) do
+        toCheck[#toCheck + 1] = val
+    end
+
+    -- Client-side: localStorage, KVP, visitorId
+    if data.localStorageId and data.localStorageId ~= '' then
+        toCheck[#toCheck + 1] = data.localStorageId
+    end
+
+    if data.kvpId and data.kvpId ~= '' then
+        toCheck[#toCheck + 1] = data.kvpId
+    end
+
+    if data.visitorId and data.visitorId ~= '' then
         toCheck[#toCheck + 1] = data.visitorId
     end
 
+    -- Client-side: device IDs
     if data.devices then
         for _, dev in ipairs(data.devices) do
-            if dev.deviceId and dev.deviceId ~= '' then
-                toCheck[#toCheck + 1] = dev.deviceId
+            if type(dev) == 'table' then
+                if dev.deviceId and dev.deviceId ~= '' then
+                    toCheck[#toCheck + 1] = dev.deviceId
+                end
+            elseif type(dev) == 'string' and dev ~= '' then
+                toCheck[#toCheck + 1] = dev
             end
         end
     end
 
     checkBan(toCheck, function(ban)
         if ban then
-            -- Zapisz nowe identyfikatory do istniejącego bana
-            -- Jeśli koleś zmienił konto/sprzęt, nowe UUIDs też wpadają do bazy
-            -- Przy następnej próbie połączenia już nie przejdzie nawet z nowym sprzętem
-            saveBanFingerprints(
-                ban.id,
-                license,
-                data.visitorId,
-                data.devices
-            )
+            -- Save ALL new fingerprints to the existing ban
+            saveBanFingerprints(ban.id, serverFp, data)
 
-            print(('[CFXMAFIA] Ban evasion attempt | %s (%s) | match: [%s] = %s | nowe ID zapisane do ban_id: %s'):format(
+            print(('[CFXMAFIA] Ban evasion attempt | %s (%s) | match: [%s] = %s | ban_id: %s'):format(
                 name, license, ban.type, ban.value, ban.id
             ))
 
-            DropPlayer(src, ('[CFXMAFIA] Jesteś zbanowany. Powód: %s'):format(
-                ban.reason or 'brak powodu'
+            DropPlayer(src, ('[CFXMAFIA] You are banned. Reason: %s'):format(
+                ban.reason or 'no reason'
             ))
             return
         end
 
-        print(('[CFXMAFIA] Czysty gracz: %s | visitorId: %s'):format(
+        print(('[CFXMAFIA] Clean player: %s | ids: %d | tokens: %d | ls: %s | kvp: %s'):format(
             license,
-            tostring(data.visitorId)
+            #serverFp.all - #serverFp.tokens,
+            #serverFp.tokens,
+            tostring(data.localStorageId),
+            tostring(data.kvpId)
         ))
     end)
 end)
 
 exports('BanPlayer', banPlayer)
+exports('GetAllPlayerFingerprints', getAllPlayerFingerprints)
